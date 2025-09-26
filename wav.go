@@ -22,6 +22,124 @@ func NewWav(codec *Codec) *Wav {
 	}
 }
 
+func NewWavFromBytes(b []byte) (*Wav, error) {
+	// RIFF header: "RIFF" + size + "WAVE"
+	if len(b) < 12 || string(b[0:4]) != "RIFF" || string(b[8:12]) != "WAVE" {
+		return nil, InvalidWAV
+	}
+
+	var (
+		codecFound bool
+		dataFound  bool
+		dataStart  int
+		dataSize   uint32
+		c          Codec // local so we can take address later
+	)
+
+	// Walk chunks
+	// Each chunk: 4-byte id, 4-byte size, then size bytes, padded to even.
+	i := 12
+	for {
+		if i+8 > len(b) {
+			break
+		}
+		chunkID := string(b[i : i+4])
+		chunkSize := binary.LittleEndian.Uint32(b[i+4 : i+8])
+		payloadStart := i + 8
+		payloadEnd := payloadStart + int(chunkSize)
+		if payloadEnd > len(b) {
+			return nil, TruncatedWAV
+		}
+
+		switch chunkID {
+		case "fmt ":
+			// Parse minimal fmt header
+			if chunkSize < 16 {
+				return nil, fmt.Errorf("invalid fmt chunk: size=%d", chunkSize)
+			}
+			audioFormat := binary.LittleEndian.Uint16(b[payloadStart+0 : payloadStart+2]) // wFormatTag
+			numChannels := binary.LittleEndian.Uint16(b[payloadStart+2 : payloadStart+4]) // nChannels
+			sampleRate := binary.LittleEndian.Uint32(b[payloadStart+4 : payloadStart+8])  // nSamplesPerSec
+			// byteRate := binary.LittleEndian.Uint32(b[payloadStart+8 : payloadStart+12]) // nAvgBytesPerSec
+			blockAlign := binary.LittleEndian.Uint16(b[payloadStart+12 : payloadStart+14])    // nBlockAlign
+			bitsPerSample := binary.LittleEndian.Uint16(b[payloadStart+14 : payloadStart+16]) // wBitsPerSample
+
+			// Optional extension length exists when chunkSize >= 18
+			var extLen uint16
+			if chunkSize >= 18 {
+				extLen = binary.LittleEndian.Uint16(b[payloadStart+16 : payloadStart+18])
+				// We do not need extension bytes for PCM/A/µ-law here.
+			}
+			_ = blockAlign // kept for sanity; SampleSize is derived from codec in this package
+
+			// Map to Codec
+			switch audioFormat {
+			case 1: // PCM
+				c.Name = Pcm
+			case 6: // A-law
+				c.Name = PcmA
+			case 7: // µ-law
+				c.Name = PcmU
+			default:
+				return nil, fmt.Errorf("%w: format tag=%d", UnsupportedFormat, audioFormat)
+			}
+
+			// This package models mono only. Enforce it to avoid incorrect header regeneration later.
+			if numChannels != 1 {
+				return nil, StereoNotSupported
+			}
+
+			c.SampleRate = int(sampleRate)
+			c.BitRate = int(bitsPerSample)
+
+			codecFound = true
+
+			// Skip fmt payload (+ extension if present)
+			_ = extLen
+
+		case "data":
+			dataFound = true
+			dataStart = payloadStart
+			dataSize = chunkSize
+
+		default:
+			// Unknown chunk: skip
+		}
+
+		// Advance to next chunk with word alignment
+		step := int(chunkSize)
+		if step%2 == 1 {
+			step++ // pad byte if odd-sized chunk
+		}
+		i = payloadStart + step
+	}
+
+	if !codecFound {
+		return nil, fmt.Errorf("fmt chunk not found")
+	}
+	if !dataFound {
+		return nil, fmt.Errorf("data chunk not found")
+	}
+	if dataStart+int(dataSize) > len(b) {
+		return nil, TruncatedWAV
+	}
+
+	// Preserve original header bytes up to the start of the data payload (includes the "data" + size fields).
+	hdr := make([]byte, dataStart)
+	copy(hdr, b[:dataStart])
+
+	// Copy data payload
+	d := make([]byte, int(dataSize))
+	copy(d, b[dataStart:int(dataStart)+int(dataSize)])
+
+	return &Wav{
+		headers:  hdr,
+		data:     d,
+		codec:    &c,
+		read:     0,
+		editable: false, // parsed files are read-only by default
+	}, nil
+}
 func (w *Wav) DataSize() int {
 	return len(w.data)
 }
